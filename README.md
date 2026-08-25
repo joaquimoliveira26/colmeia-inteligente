@@ -1,8 +1,8 @@
-🐝 Colmeia Inteligente
+Colmeia Inteligente
 
 Sistema IoT desenvolvido para monitoramento de colmeias utilizando ESP32 e sensores, com coleta e transmissão de dados para acompanhamento das condições da colmeia.
 
-📌 Sobre o projeto
+ Sobre o projeto
 
 A Colmeia Inteligente tem como objetivo auxiliar no acompanhamento das condições da colmeia por meio de sensores e monitoramento remoto.
 
@@ -10,7 +10,7 @@ O sistema coleta informações relacionadas à temperatura, umidade, som e abert
 
 Os dados são processados pelo ESP32 e enviados para uma plataforma de monitoramento, possibilitando o acompanhamento das informações de forma remota.
 
-🔧 Tecnologias e componentes
+Tecnologias e componentes
 
 - ESP32 DevKit V1
 - Sensor DHT11 para temperatura e umidade interna
@@ -24,26 +24,26 @@ Os dados são processados pelo ESP32 e enviados para uma plataforma de monitoram
 - Conversor Boost
 - Modelagem e impressão 3D
 
-📊 Dados monitorados
+ Dados monitorados
 
-- 🌡️ Temperatura interna e externa
-- 💧 Umidade interna e externa
-- 🎙️ Som da colmeia
-- 🚪 Abertura da colmeia
+- Temperatura interna e externa
+-  Umidade interna e externa
+-  Som da colmeia
+-  Abertura da colmeia
 
-📡 Monitoramento e comunicação
+Monitoramento e comunicação
 
 O ESP32 realiza a leitura dos sensores e processa as informações coletadas. Por meio da conexão Wi-Fi, os dados são enviados para o Firebase Realtime Database, permitindo o armazenamento e acompanhamento remoto das informações.
 
-🔋 Sistema de alimentação
+Sistema de alimentação
 
 O sistema utiliza células de lítio 18650 de 3,7 V, juntamente com circuito de proteção e conversor de tensão, fornecendo a alimentação necessária para o ESP32 e os sensores.
 
-🖨️ Estrutura e fabricação
+ Estrutura e fabricação
 
 Parte da estrutura do projeto foi desenvolvida utilizando modelagem e impressão 3D, possibilitando a criação de peças adaptadas ao sistema de monitoramento da colmeia.
 
-📁 Estrutura do projeto
+Estrutura do projeto
 
 - "codigo/" — Código utilizado no ESP32
 - "modelos-3d/" — Modelos utilizados na impressão 3D
@@ -52,6 +52,6 @@ Parte da estrutura do projeto foi desenvolvida utilizando modelagem e impressão
 - "documentos/" — Documentação do projeto
 - "resultados/" — Testes, medições e resultados
 
-👨‍💻 Projeto
+ Projeto
 
 Projeto desenvolvido para fins acadêmicos e de pesquisa, com o objetivo de aplicar tecnologias de IoT, eletrônica e monitoramento remoto no acompanhamento de colmeias de abelhas.
