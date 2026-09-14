@@ -1,0 +1,1761 @@
+
+
+
+
+// Projeto: Monitoramento IoT de colmeia
+// Versão do firmware: 2.8
+// Arquivo: codigo_circuito_colmeia_v2_8.ino
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <LittleFS.h>
+#include "driver/i2s_std.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
+#include "esp_system.h"
+#include <math.h>
+#include <string.h>
+#include <time.h>
+
+// Este sketch usa a API I2S atual do ESP-IDF 5 / Arduino-ESP32 3.x.
+// Não misture "driver/i2s.h" (API legada) com analogRead(), pois isso pode
+// causar o abort "ADC: CONFLICT! driver_ng is not allowed to be used with
+// the legacy driver" antes mesmo da execução de setup().
+
+// =======================================================
+// 1. CONFIGURAÇÕES QUE VOCÊ DEVE ALTERAR
+// =======================================================
+
+const char* WIFI_SSID = "DN Maria";
+const char* WIFI_PASSWORD = "92642726";
+
+// URL do Realtime Database, sem barra no final.
+// Exemplo:
+// https://seu-projeto-default-rtdb.firebaseio.com
+// ou
+// https://seu-projeto-default-rtdb.firebasedatabase.app
+const char* FIREBASE_DATABASE_URL = "https://colmeia-iot-eb410-default-rtdb.firebaseio.com";
+
+// Web API Key do projeto Firebase
+const char* FIREBASE_API_KEY = "AIzaSyCxT7JgMZKAoW_gQFlg-bZflckalJ6aGYs";
+
+// Usuário criado em Firebase Authentication
+const char* FIREBASE_USER_EMAIL = "fernandesalvesg6@gmail.com";
+const char* FIREBASE_USER_PASSWORD = "Biel3006@";
+
+// Identificação desta colmeia no banco
+const char* HIVE_ID = "colmeia_01";
+
+// Identificação da versão enviada ao Firebase e exibida no monitor serial
+const char* FIRMWARE_VERSION = "2.8";
+const char* FIRMWARE_ID = "esp32_colmeia_deepsleep_firebase_v2_8";
+
+
+// =======================================================
+// 2. PINOS DO CIRCUITO
+// =======================================================
+
+const int PIN_DHT1 = 4;    // DHT11 externo
+const int PIN_DHT2 = 21;   // DHT11 interno
+
+const int PIN_MC38 = 27;   // MC-38 da tampa
+
+const int PIN_BATTERY = 34; // BAT_SENSE, vindo do divisor de tensão
+
+// INMP441
+const int PIN_I2S_WS   = 25;
+const int PIN_I2S_BCLK = 26;
+const int PIN_I2S_DOUT = 33;
+
+// Frequência de amostragem do microfone.
+// Deixe este valor igual ao usado no I2S e nos cálculos acústicos.
+const int AUDIO_SAMPLE_RATE_HZ = 16000;
+
+
+// =======================================================
+// 3. CONFIGURAÇÕES DE MEDIÇÃO E SONO
+// =======================================================
+//
+// Esta é a parte principal para ajustar depois.
+//
+// Para colmeia em campo:
+// - O intervalo periódico de coleta está configurado em 10 minutos.
+// - Temperatura e umidade não mudam tão rápido.
+// - Áudio é medido por uma janela curta.
+// - Wi-Fi fica desligado nas coletas intermediárias.
+// - As medições são armazenadas na flash interna.
+// - Durante o dia, o lote de medições é enviado a cada 2 horas.
+// - Não há envio entre 23h e 05h59; os dados ficam guardados na flash.
+// - Às 06h, as medições acumuladas durante a madrugada são enviadas.
+
+const uint64_t SLEEP_INTERVAL_SECONDS = 10ULL * 60ULL; // acorda a cada 10 min
+const uint64_t LID_OPEN_SLEEP_SECONDS = 60ULL;          // se a tampa estiver aberta, checa de novo em 1 min
+const unsigned long AUDIO_WINDOW_MS = 3000UL;          // mede áudio por 3 s
+
+// Intervalo entre tentativas periódicas de envio. As coletas continuam a cada
+// 10 minutos, portanto normalmente doze medições formam o lote de duas horas.
+const uint64_t UPLOAD_INTERVAL_SECONDS = 2ULL * 60ULL * 60ULL;
+
+// Janela diária de envio no horário local de Goiás/Brasília.
+// Há envios a cada duas horas, às 06h, 08h, 10h, 12h, 14h, 16h, 18h, 20h e
+// 22h. Depois da tentativa das 22h, a próxima fica programada para as 06h.
+const int UPLOAD_WINDOW_START_HOUR = 6;
+const int UPLOAD_WINDOW_LAST_HOUR = 22;
+
+// Limita cada requisição a doze medições. Se houver dados acumulados após uma
+// falha de internet, vários lotes são enviados usando a mesma conexão Wi-Fi.
+const size_t READINGS_PER_FIREBASE_BATCH = 12;
+
+// Tempo máximo tentando conectar ao Wi-Fi.
+// Se não conectar, o ESP32 dorme e tenta novamente no próximo ciclo.
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000UL;
+
+// Tempo máximo tentando enviar dados.
+// É aplicado tanto à conexão quanto à leitura da resposta HTTPS.
+const unsigned long FIREBASE_TIMEOUT_MS = 15000UL;
+
+// Horário de Goiás/Brasília: UTC-3, sem horário de verão.
+// O relógio é sincronizado pela internet depois da conexão Wi-Fi.
+const long GMT_OFFSET_SECONDS = -3L * 60L * 60L;
+const int DAYLIGHT_OFFSET_SECONDS = 0;
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.google.com";
+const unsigned long NTP_SYNC_TIMEOUT_MS = 10000UL;
+
+// Fila local na flash interna. Com 2016 posições, ela guarda até 14 dias de
+// coletas regulares de 10 em 10 minutos. Ao atingir o limite, a medição mais
+// antiga é removida para permitir a entrada da mais recente.
+// No Arduino IDE, mantenha um esquema de partição com área para sistema de
+// arquivos, como "Default 4MB with spiffs". LittleFS usa essa área de dados.
+const char* QUEUE_FILE = "/fila_medicoes.bin";
+const char* QUEUE_TEMP_FILE = "/fila_medicoes.tmp";
+const char* QUEUE_BACKUP_FILE = "/fila_medicoes.bak";
+const size_t MAX_STORED_READINGS = 2016;
+
+
+// =======================================================
+// 4. CONFIGURAÇÃO DO MC-38 E DESPERTAR POR TAMPA
+// =======================================================
+//
+// Com a ligação:
+//
+// GPIO27 ---- MC-38 ---- GND
+//
+// e usando INPUT_PULLUP:
+//
+// contato aberto  -> GPIO27 = HIGH
+// contato fechado -> GPIO27 = LOW
+//
+// Na montagem mais comum:
+// - tampa fechada: ímã perto do MC-38, contato fechado, GPIO27 = LOW;
+// - tampa aberta: ímã longe do MC-38, contato aberto, GPIO27 = HIGH.
+//
+// Por isso deixei o padrão abaixo como HIGH.
+// Se no seu teste a lógica ficar invertida, troque HIGH por LOW.
+
+const bool ENABLE_LID_WAKEUP = true;
+const int LID_OPEN_LEVEL = HIGH;
+
+
+// =======================================================
+// 5. CONFIGURAÇÃO DA BATERIA
+// =======================================================
+//
+// Seu divisor:
+// +SYS -- 100 kΩ -- BAT_SENSE -- 100 kΩ -- GND
+//
+// O GPIO34 recebe metade da tensão de +SYS.
+// Logo: V_bateria ≈ 2 × V_GPIO34.
+
+const float BATTERY_DIVIDER_FACTOR = 2.0;
+const float BATTERY_CALIBRATION = 1.000;
+
+const float BATTERY_EMPTY_V = 3.20;
+const float BATTERY_FULL_V  = 4.15;
+
+
+// =======================================================
+// 6. OBJETOS E VARIÁVEIS
+// =======================================================
+
+DHT dht1(PIN_DHT1, DHT11);
+DHT dht2(PIN_DHT2, DHT11);
+
+WiFiClientSecure secureClient;
+
+// Formato compacto usado na fila binária da flash. Os campos de identificação
+// e checksum permitem detectar registros incompletos ou incompatíveis.
+const uint32_t STORED_READING_MAGIC = 0xA8E12727UL;
+const uint16_t STORED_READING_FORMAT_VERSION = 1;
+
+enum StoredWakeupCause : uint8_t {
+  WAKEUP_POWER_OR_RESET = 0,
+  WAKEUP_TIMER = 1,
+  WAKEUP_LID = 2,
+  WAKEUP_OTHER = 3
+};
+
+struct StoredReading {
+  uint32_t magic;
+  uint32_t checksum;
+  uint32_t idHigh;
+  uint32_t idLow;
+  uint32_t bootNumber;
+  uint32_t awakeUptimeMs;
+  int64_t measurementUnixS;
+
+  float batteryV;
+  float batteryPct;
+  float externalTempC;
+  float externalHumPct;
+  float internalTempC;
+  float internalHumPct;
+  float audioRms;
+  float audioDbfs;
+  float audioZeroCrossHz;
+
+  uint32_t audioSamplesUsed;
+  uint32_t sleepIntervalSeconds;
+  uint32_t lidOpenSleepSeconds;
+  uint32_t audioWindowMs;
+  uint32_t audioSampleRateHz;
+
+  uint16_t formatVersion;
+  uint16_t recordSize;
+  int8_t mc38Raw;
+  uint8_t lidOpen;
+  uint8_t wakeupCause;
+  uint8_t measurementTimeValid;
+
+  char firmwareVersion[8];
+};
+
+static_assert(
+  sizeof(StoredReading) == 104,
+  "O formato da fila local mudou inesperadamente."
+);
+
+float dht1TempC = NAN;
+float dht1HumPct = NAN;
+float dht2TempC = NAN;
+float dht2HumPct = NAN;
+
+float batteryV = NAN;
+float batteryPct = NAN;
+
+float audioRms = NAN;
+float audioDbfs = NAN;
+float audioZeroCrossHz = NAN;
+int audioSamplesUsed = 0;
+
+int mc38Raw = -1;
+bool lidOpen = false;
+
+String firebaseIdToken = "";
+
+// Momento em que o ciclo de medição foi concluído.
+// O valor absoluto é calculado após a sincronização NTP.
+unsigned long measurementUptimeMs = 0;
+time_t measurementUnixS = 0;
+String measurementTimeLocal = "";
+
+bool i2sStarted = false;
+i2s_chan_handle_t i2sRxChannel = nullptr;
+
+RTC_DATA_ATTR unsigned long bootCount = 0;
+
+// Estado mínimo mantido no domínio RTC durante o deep sleep. O relógio do
+// sistema, depois de sincronizado por NTP, também continua avançando no sono.
+const uint32_t RTC_STATE_SIGNATURE = 0xC01AE127UL;
+RTC_DATA_ATTR uint32_t rtcStateSignature = 0;
+RTC_DATA_ATTR int64_t nextPeriodicUploadUnixS = 0;
+RTC_DATA_ATTR uint32_t secondsSinceLastPeriodicAttempt = 0;
+RTC_DATA_ATTR uint32_t lastPlannedSleepSeconds = 0;
+
+bool localStorageReady = false;
+
+
+// =======================================================
+// 7. FUNÇÕES AUXILIARES
+// =======================================================
+
+String jsonEscape(const String& s) {
+  String out = "";
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+
+    if (c == '\\') out += "\\\\";
+    else if (c == '"') out += "\\\"";
+    else if (c == '\n') out += "\\n";
+    else if (c == '\r') out += "\\r";
+    else if (c == '\t') out += "\\t";
+    else out += c;
+  }
+
+  return out;
+}
+
+String numberOrNull(float value, int digits) {
+  if (isnan(value) || isinf(value)) return "null";
+  return String(value, digits);
+}
+
+float clampFloat(float x, float a, float b) {
+  if (x < a) return a;
+  if (x > b) return b;
+  return x;
+}
+
+String wakeupCauseText() {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+
+  switch (cause) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      return "tampa_ext0";
+
+    case ESP_SLEEP_WAKEUP_TIMER:
+      return "temporizador";
+
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+      return "ligado_ou_reiniciado";
+
+    default:
+      return "outro";
+  }
+}
+
+uint8_t currentStoredWakeupCause() {
+  switch (esp_sleep_get_wakeup_cause()) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      return WAKEUP_LID;
+
+    case ESP_SLEEP_WAKEUP_TIMER:
+      return WAKEUP_TIMER;
+
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+      return WAKEUP_POWER_OR_RESET;
+
+    default:
+      return WAKEUP_OTHER;
+  }
+}
+
+String storedWakeupCauseText(uint8_t cause) {
+  switch (cause) {
+    case WAKEUP_LID:
+      return "tampa_ext0";
+
+    case WAKEUP_TIMER:
+      return "temporizador";
+
+    case WAKEUP_POWER_OR_RESET:
+      return "ligado_ou_reiniciado";
+
+    default:
+      return "outro";
+  }
+}
+
+bool systemClockIsValid() {
+  // 01/01/2024 00:00:00 UTC. Evita aceitar o horário padrão de 1970.
+  return time(nullptr) >= 1704067200;
+}
+
+void formatMeasurementTime(time_t timestamp) {
+  time_t localTimestamp = timestamp + GMT_OFFSET_SECONDS;
+  struct tm localTime;
+  gmtime_r(&localTimestamp, &localTime);
+
+  char buffer[24];
+  strftime(buffer, sizeof(buffer), "%d/%m/%Y %H:%M:%S", &localTime);
+  measurementTimeLocal = String(buffer);
+}
+
+bool captureMeasurementTimeFromClock() {
+  if (!systemClockIsValid()) {
+    measurementUnixS = 0;
+    measurementTimeLocal = "";
+    return false;
+  }
+
+  time_t currentUnixS = time(nullptr);
+  unsigned long elapsedAfterMeasurementMs = millis() - measurementUptimeMs;
+  measurementUnixS =
+    currentUnixS - (time_t)((elapsedAfterMeasurementMs + 500UL) / 1000UL);
+
+  formatMeasurementTime(measurementUnixS);
+  return true;
+}
+
+bool synchronizeMeasurementTime() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  Serial.println("Sincronizando horário pela internet...");
+
+  configTime(
+    GMT_OFFSET_SECONDS,
+    DAYLIGHT_OFFSET_SECONDS,
+    NTP_SERVER_1,
+    NTP_SERVER_2
+  );
+
+  unsigned long start = millis();
+
+  while (!systemClockIsValid() &&
+         millis() - start < NTP_SYNC_TIMEOUT_MS) {
+    delay(250);
+  }
+
+  if (!systemClockIsValid()) {
+    measurementUnixS = 0;
+    measurementTimeLocal = "";
+    Serial.println("Não foi possível obter o horário neste ciclo.");
+    return false;
+  }
+
+  // As medições são feitas antes de ligar o Wi-Fi. A função desconta o tempo
+  // transcorrido desde o fim das leituras.
+  captureMeasurementTimeFromClock();
+
+  Serial.print("Horário da medição: ");
+  Serial.print(measurementTimeLocal);
+  Serial.println(" (UTC-3)");
+
+  return true;
+}
+
+
+// =======================================================
+// 8. AGENDAMENTO DOS ENVIOS DIURNOS
+// =======================================================
+
+void initializeRtcState() {
+  if (rtcStateSignature == RTC_STATE_SIGNATURE) {
+    return;
+  }
+
+  rtcStateSignature = RTC_STATE_SIGNATURE;
+  bootCount = 0;
+  nextPeriodicUploadUnixS = 0;
+  secondsSinceLastPeriodicAttempt = 0;
+  lastPlannedSleepSeconds = 0;
+}
+
+void accountForLastSleep() {
+  if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+    return;
+  }
+
+  uint64_t accumulated =
+    (uint64_t)secondsSinceLastPeriodicAttempt + lastPlannedSleepSeconds;
+
+  if (accumulated > 7ULL * 24ULL * 60ULL * 60ULL) {
+    accumulated = 7ULL * 24ULL * 60ULL * 60ULL;
+  }
+
+  secondsSinceLastPeriodicAttempt = (uint32_t)accumulated;
+}
+
+bool getLocalTimeParts(time_t utcTimestamp, struct tm& localTime) {
+  if (utcTimestamp < 1704067200) {
+    return false;
+  }
+
+  time_t localTimestamp = utcTimestamp + GMT_OFFSET_SECONDS;
+  gmtime_r(&localTimestamp, &localTime);
+  return true;
+}
+
+bool uploadWindowIsOpen(time_t utcTimestamp) {
+  struct tm localTime;
+  if (!getLocalTimeParts(utcTimestamp, localTime)) {
+    return false;
+  }
+
+  return localTime.tm_hour >= UPLOAD_WINDOW_START_HOUR &&
+         localTime.tm_hour <= UPLOAD_WINDOW_LAST_HOUR;
+}
+
+int64_t calculateNextAllowedUploadUnixS(time_t nowUtc) {
+  struct tm localTime;
+  if (!getLocalTimeParts(nowUtc, localTime)) {
+    return 0;
+  }
+
+  int secondsSinceLocalMidnight =
+    localTime.tm_hour * 3600 + localTime.tm_min * 60 + localTime.tm_sec;
+
+  // Início do dia local expresso como timestamp UTC.
+  int64_t localDayStartUtc =
+    (int64_t)nowUtc - (int64_t)secondsSinceLocalMidnight;
+
+  // Antes das 06h, a próxima tentativa será às 06h do mesmo dia.
+  if (localTime.tm_hour < UPLOAD_WINDOW_START_HOUR) {
+    return localDayStartUtc +
+           (int64_t)UPLOAD_WINDOW_START_HOUR * 3600LL;
+  }
+
+  // Depois do horário das 22h, a próxima tentativa será às 06h do dia
+  // seguinte. A hora 22 é tratada abaixo como o último horário permitido.
+  if (localTime.tm_hour > UPLOAD_WINDOW_LAST_HOUR) {
+    return localDayStartUtc + 24LL * 3600LL +
+           (int64_t)UPLOAD_WINDOW_START_HOUR * 3600LL;
+  }
+
+  // Dentro da janela diurna, alinha o próximo envio à grade
+  // 06h, 08h, 10h, ..., 22h.
+  int hoursAfterStart = localTime.tm_hour - UPLOAD_WINDOW_START_HOUR;
+  int intervalHours = (int)(UPLOAD_INTERVAL_SECONDS / 3600ULL);
+  int nextSlot = (hoursAfterStart / intervalHours) + 1;
+  int nextHour = UPLOAD_WINDOW_START_HOUR + nextSlot * intervalHours;
+
+  if (nextHour <= UPLOAD_WINDOW_LAST_HOUR) {
+    return localDayStartUtc + (int64_t)nextHour * 3600LL;
+  }
+
+  return localDayStartUtc + 24LL * 3600LL +
+         (int64_t)UPLOAD_WINDOW_START_HOUR * 3600LL;
+}
+
+bool periodicUploadIsDue() {
+  if (systemClockIsValid()) {
+    time_t nowUtc = time(nullptr);
+
+    // Mesmo que exista uma fila pendente, o Firebase não é acessado fora da
+    // janela de envio. Os registros permanecem preservados na flash.
+    if (!uploadWindowIsOpen(nowUtc)) {
+      return false;
+    }
+
+    if (nextPeriodicUploadUnixS <= 0) {
+      return true;
+    }
+
+    return (int64_t)nowUtc >= nextPeriodicUploadUnixS;
+  }
+
+  // Ao ligar ou gravar um novo firmware, ainda não sabemos o horário. Ligamos
+  // o Wi-Fi uma vez para consultar o NTP, mas só enviamos ao Firebase depois
+  // de confirmar que estamos dentro da janela diurna.
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    return true;
+  }
+
+  // Enquanto o NTP ainda não foi obtido, usa o tempo de sono acumulado como
+  // plano B. Isso evita tentar ligar o Wi-Fi a cada coleta quando a rede cai.
+  return secondsSinceLastPeriodicAttempt >= UPLOAD_INTERVAL_SECONDS;
+}
+
+void markPeriodicUploadAttempt() {
+  secondsSinceLastPeriodicAttempt = 0;
+
+  if (systemClockIsValid()) {
+    nextPeriodicUploadUnixS =
+      calculateNextAllowedUploadUnixS(time(nullptr));
+  } else {
+    nextPeriodicUploadUnixS = 0;
+  }
+}
+
+
+// =======================================================
+// 9. FILA LOCAL NA FLASH / LITTLEFS
+// =======================================================
+
+uint32_t calculateReadingChecksum(const StoredReading& source) {
+  StoredReading reading = source;
+  reading.checksum = 0;
+
+  const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&reading);
+  uint32_t hash = 2166136261UL;
+
+  for (size_t i = 0; i < sizeof(StoredReading); i++) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+
+  return hash;
+}
+
+bool storedReadingIsValid(const StoredReading& reading) {
+  if (reading.magic != STORED_READING_MAGIC) return false;
+  if (reading.formatVersion != STORED_READING_FORMAT_VERSION) return false;
+  if (reading.recordSize != sizeof(StoredReading)) return false;
+  return reading.checksum == calculateReadingChecksum(reading);
+}
+
+bool initializeLocalStorage() {
+  Serial.println("Inicializando armazenamento local...");
+
+  // O parâmetro true formata somente quando a montagem inicial falha. Isso é
+  // necessário na primeira utilização da partição LittleFS.
+  if (!LittleFS.begin(true)) {
+    Serial.println("Falha ao montar LittleFS. A fila local não está disponível.");
+    return false;
+  }
+
+  // Recuperação após eventual interrupção de energia durante a reescrita.
+  if (!LittleFS.exists(QUEUE_FILE) && LittleFS.exists(QUEUE_BACKUP_FILE)) {
+    LittleFS.rename(QUEUE_BACKUP_FILE, QUEUE_FILE);
+  }
+
+  if (LittleFS.exists(QUEUE_FILE) && LittleFS.exists(QUEUE_BACKUP_FILE)) {
+    LittleFS.remove(QUEUE_BACKUP_FILE);
+  }
+
+  if (LittleFS.exists(QUEUE_TEMP_FILE)) {
+    LittleFS.remove(QUEUE_TEMP_FILE);
+  }
+
+  Serial.println("LittleFS pronto.");
+  return true;
+}
+
+size_t storedReadingCount() {
+  if (!localStorageReady || !LittleFS.exists(QUEUE_FILE)) {
+    return 0;
+  }
+
+  File file = LittleFS.open(QUEUE_FILE, FILE_READ);
+  if (!file) return 0;
+
+  size_t count = file.size() / sizeof(StoredReading);
+  file.close();
+  return count;
+}
+
+bool removeFirstRawRecords(size_t recordsToRemove) {
+  if (!localStorageReady || recordsToRemove == 0) return true;
+  if (!LittleFS.exists(QUEUE_FILE)) return true;
+
+  File source = LittleFS.open(QUEUE_FILE, FILE_READ);
+  if (!source) {
+    Serial.println("Não foi possível abrir a fila para remoção.");
+    return false;
+  }
+
+  size_t sourceSize = source.size();
+  size_t bytesToSkip = recordsToRemove * sizeof(StoredReading);
+
+  // Também elimina uma eventual cauda incompleta, que não constitui registro.
+  if (bytesToSkip >= sourceSize ||
+      sourceSize - bytesToSkip < sizeof(StoredReading)) {
+    source.close();
+    LittleFS.remove(QUEUE_FILE);
+    LittleFS.remove(QUEUE_TEMP_FILE);
+    LittleFS.remove(QUEUE_BACKUP_FILE);
+    return true;
+  }
+
+  LittleFS.remove(QUEUE_TEMP_FILE);
+  File destination = LittleFS.open(QUEUE_TEMP_FILE, FILE_WRITE);
+
+  if (!destination || !source.seek(bytesToSkip)) {
+    Serial.println("Falha ao preparar a atualização da fila local.");
+    if (destination) destination.close();
+    source.close();
+    LittleFS.remove(QUEUE_TEMP_FILE);
+    return false;
+  }
+
+  uint8_t buffer[256];
+
+  while (source.available()) {
+    size_t bytesRead = source.read(buffer, sizeof(buffer));
+    if (bytesRead == 0) break;
+
+    if (destination.write(buffer, bytesRead) != bytesRead) {
+      Serial.println("Falha ao reescrever a fila local.");
+      destination.close();
+      source.close();
+      LittleFS.remove(QUEUE_TEMP_FILE);
+      return false;
+    }
+  }
+
+  destination.flush();
+  destination.close();
+  source.close();
+
+  LittleFS.remove(QUEUE_BACKUP_FILE);
+
+  if (!LittleFS.rename(QUEUE_FILE, QUEUE_BACKUP_FILE)) {
+    Serial.println("Falha ao criar backup temporário da fila.");
+    LittleFS.remove(QUEUE_TEMP_FILE);
+    return false;
+  }
+
+  if (!LittleFS.rename(QUEUE_TEMP_FILE, QUEUE_FILE)) {
+    Serial.println("Falha ao substituir a fila; restaurando backup.");
+    LittleFS.rename(QUEUE_BACKUP_FILE, QUEUE_FILE);
+    LittleFS.remove(QUEUE_TEMP_FILE);
+    return false;
+  }
+
+  LittleFS.remove(QUEUE_BACKUP_FILE);
+  return true;
+}
+
+StoredReading captureCurrentReading() {
+  StoredReading reading = {};
+
+  reading.magic = STORED_READING_MAGIC;
+  reading.formatVersion = STORED_READING_FORMAT_VERSION;
+  reading.recordSize = sizeof(StoredReading);
+  reading.idHigh = esp_random();
+  reading.idLow = esp_random();
+  reading.bootNumber = (uint32_t)bootCount;
+  reading.awakeUptimeMs = measurementUptimeMs;
+  reading.measurementUnixS = (int64_t)measurementUnixS;
+
+  reading.batteryV = batteryV;
+  reading.batteryPct = batteryPct;
+  reading.externalTempC = dht1TempC;
+  reading.externalHumPct = dht1HumPct;
+  reading.internalTempC = dht2TempC;
+  reading.internalHumPct = dht2HumPct;
+  reading.audioRms = audioRms;
+  reading.audioDbfs = audioDbfs;
+  reading.audioZeroCrossHz = audioZeroCrossHz;
+
+  reading.audioSamplesUsed = audioSamplesUsed;
+  reading.sleepIntervalSeconds = (uint32_t)SLEEP_INTERVAL_SECONDS;
+  reading.lidOpenSleepSeconds = (uint32_t)LID_OPEN_SLEEP_SECONDS;
+  reading.audioWindowMs = AUDIO_WINDOW_MS;
+  reading.audioSampleRateHz = AUDIO_SAMPLE_RATE_HZ;
+
+  reading.mc38Raw = (int8_t)mc38Raw;
+  reading.lidOpen = lidOpen ? 1 : 0;
+  reading.wakeupCause = currentStoredWakeupCause();
+  reading.measurementTimeValid = measurementUnixS > 0 ? 1 : 0;
+
+  strncpy(
+    reading.firmwareVersion,
+    FIRMWARE_VERSION,
+    sizeof(reading.firmwareVersion) - 1
+  );
+  reading.firmwareVersion[sizeof(reading.firmwareVersion) - 1] = '\0';
+
+  reading.checksum = calculateReadingChecksum(reading);
+  return reading;
+}
+
+bool appendStoredReading(const StoredReading& reading) {
+  if (!localStorageReady) return false;
+
+  size_t count = storedReadingCount();
+  if (count >= MAX_STORED_READINGS) {
+    size_t excess = count - MAX_STORED_READINGS + 1;
+    Serial.println("Fila cheia. Removendo a medição mais antiga.");
+
+    if (!removeFirstRawRecords(excess)) {
+      return false;
+    }
+  }
+
+  File file = LittleFS.open(QUEUE_FILE, FILE_APPEND);
+  if (!file) {
+    Serial.println("Falha ao abrir a fila para gravação.");
+    return false;
+  }
+
+  size_t bytesWritten = file.write(
+    reinterpret_cast<const uint8_t*>(&reading),
+    sizeof(StoredReading)
+  );
+
+  file.flush();
+  file.close();
+
+  if (bytesWritten != sizeof(StoredReading)) {
+    Serial.println("Falha ao gravar a medição completa na flash.");
+    return false;
+  }
+
+  Serial.print("Medição armazenada. Itens na fila: ");
+  Serial.println(storedReadingCount());
+  return true;
+}
+
+
+// =======================================================
+// 10. WI-FI
+// =======================================================
+
+bool connectWiFi() {
+  Serial.println("Ligando Wi-Fi...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true);
+  delay(300);
+
+  WiFi.setSleep(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Wi-Fi conectado. IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("RSSI: ");
+    Serial.println(WiFi.RSSI());
+    return true;
+  }
+
+  Serial.println("Wi-Fi não conectou neste ciclo.");
+  return false;
+}
+
+void shutdownWiFi() {
+  Serial.println("Desligando Wi-Fi...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  btStop();
+  delay(200);
+}
+
+
+// =======================================================
+// 11. FIREBASE AUTH
+// =======================================================
+
+bool firebaseSignIn() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  HTTPClient http;
+  http.setConnectTimeout(FIREBASE_TIMEOUT_MS);
+  http.setTimeout(FIREBASE_TIMEOUT_MS);
+
+  String url = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=";
+  url += FIREBASE_API_KEY;
+
+  if (!http.begin(secureClient, url)) {
+    Serial.println("Erro ao iniciar HTTPS para login Firebase.");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  String body = "{";
+  body += "\"email\":\"" + jsonEscape(FIREBASE_USER_EMAIL) + "\",";
+  body += "\"password\":\"" + jsonEscape(FIREBASE_USER_PASSWORD) + "\",";
+  body += "\"returnSecureToken\":true";
+  body += "}";
+
+  int code = http.POST(body);
+  String response = http.getString();
+  http.end();
+
+  if (code < 200 || code >= 300) {
+    Serial.print("Falha no login Firebase. HTTP ");
+    Serial.println(code);
+    Serial.println(response);
+    return false;
+  }
+
+  DynamicJsonDocument doc(4096);
+  DeserializationError err = deserializeJson(doc, response);
+
+  if (err) {
+    Serial.print("Erro ao interpretar login Firebase: ");
+    Serial.println(err.c_str());
+    return false;
+  }
+
+  firebaseIdToken = doc["idToken"].as<String>();
+
+  if (firebaseIdToken.length() == 0) {
+    Serial.println("Login Firebase não retornou idToken.");
+    return false;
+  }
+
+  Serial.println("Login Firebase OK.");
+  return true;
+}
+
+
+// =======================================================
+// 12. FIREBASE DATABASE
+// =======================================================
+
+bool firebaseRequest(const String& method, const String& path, const String& jsonBody) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (firebaseIdToken.length() == 0) {
+    if (!firebaseSignIn()) return false;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(FIREBASE_TIMEOUT_MS);
+  http.setTimeout(FIREBASE_TIMEOUT_MS);
+
+  String url = String(FIREBASE_DATABASE_URL);
+  url += path;
+  url += ".json?auth=";
+  url += firebaseIdToken;
+
+  if (!http.begin(secureClient, url)) {
+    Serial.println("Erro ao iniciar HTTPS para Database.");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  int code = -1;
+
+  if (method == "POST") {
+    code = http.POST(jsonBody);
+  } else if (method == "PUT") {
+    code = http.PUT(jsonBody);
+  } else if (method == "PATCH") {
+    code = http.sendRequest("PATCH", jsonBody);
+  } else {
+    Serial.println("Método HTTP não suportado.");
+    http.end();
+    return false;
+  }
+
+  String response = http.getString();
+  http.end();
+
+  if (code >= 200 && code < 300) {
+    Serial.print("Firebase ");
+    Serial.print(method);
+    Serial.print(" OK. HTTP ");
+    Serial.println(code);
+    return true;
+  }
+
+  Serial.print("Erro Firebase ");
+  Serial.print(method);
+  Serial.print(". HTTP ");
+  Serial.println(code);
+  Serial.println(response);
+
+  return false;
+}
+
+bool firebasePost(const String& path, const String& jsonBody) {
+  return firebaseRequest("POST", path, jsonBody);
+}
+
+bool firebasePut(const String& path, const String& jsonBody) {
+  return firebaseRequest("PUT", path, jsonBody);
+}
+
+bool firebasePatch(const String& path, const String& jsonBody) {
+  return firebaseRequest("PATCH", path, jsonBody);
+}
+
+
+// =======================================================
+// 13. DHT11
+// =======================================================
+
+void readDHTSensors() {
+  Serial.println("Lendo DHT11...");
+
+  float t1 = dht1.readTemperature();
+  float h1 = dht1.readHumidity();
+
+  float t2 = dht2.readTemperature();
+  float h2 = dht2.readHumidity();
+
+  if (isnan(t1) || isnan(h1)) {
+    Serial.println("Falha ao ler DHT11 #1.");
+    dht1TempC = NAN;
+    dht1HumPct = NAN;
+  } else {
+    dht1TempC = t1;
+    dht1HumPct = h1;
+  }
+
+  if (isnan(t2) || isnan(h2)) {
+    Serial.println("Falha ao ler DHT11 #2.");
+    dht2TempC = NAN;
+    dht2HumPct = NAN;
+  } else {
+    dht2TempC = t2;
+    dht2HumPct = h2;
+  }
+
+  Serial.print("DHT1 T/H: ");
+  Serial.print(dht1TempC);
+  Serial.print(" C / ");
+  Serial.print(dht1HumPct);
+  Serial.println(" %");
+
+  Serial.print("DHT2 T/H: ");
+  Serial.print(dht2TempC);
+  Serial.print(" C / ");
+  Serial.print(dht2HumPct);
+  Serial.println(" %");
+}
+
+
+// =======================================================
+// 14. BATERIA
+// =======================================================
+
+void readBattery() {
+  Serial.println("Lendo bateria...");
+
+  const int samples = 30;
+  uint32_t sumMv = 0;
+
+  for (int i = 0; i < samples; i++) {
+    sumMv += analogReadMilliVolts(PIN_BATTERY);
+    delay(5);
+  }
+
+  float nodeV = (sumMv / (float)samples) / 1000.0;
+
+  batteryV = nodeV * BATTERY_DIVIDER_FACTOR * BATTERY_CALIBRATION;
+
+  batteryPct = 100.0 * (batteryV - BATTERY_EMPTY_V) /
+               (BATTERY_FULL_V - BATTERY_EMPTY_V);
+
+  batteryPct = clampFloat(batteryPct, 0.0, 100.0);
+
+  Serial.print("Bateria: ");
+  Serial.print(batteryV, 3);
+  Serial.print(" V | ");
+  Serial.print(batteryPct, 1);
+  Serial.println(" % estimado");
+}
+
+
+// =======================================================
+// 15. MC-38
+// =======================================================
+
+void readLidSensor() {
+  mc38Raw = digitalRead(PIN_MC38);
+  lidOpen = (mc38Raw == LID_OPEN_LEVEL);
+
+  Serial.print("MC-38 raw: ");
+  Serial.print(mc38Raw);
+  Serial.print(" | tampa_aberta: ");
+  Serial.println(lidOpen ? "true" : "false");
+}
+
+
+// =======================================================
+// 16. INMP441 / I2S
+// =======================================================
+
+bool setupI2S() {
+  i2sStarted = false;
+  i2sRxChannel = nullptr;
+
+  i2s_chan_config_t channelConfig =
+    I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+
+  channelConfig.dma_desc_num = 4;
+  channelConfig.dma_frame_num = 512;
+
+  esp_err_t err = i2s_new_channel(
+    &channelConfig,
+    nullptr,
+    &i2sRxChannel
+  );
+
+  if (err != ESP_OK) {
+    Serial.print("Erro ao criar canal RX I2S: ");
+    Serial.println(err);
+    i2sRxChannel = nullptr;
+    return false;
+  }
+
+  i2s_std_config_t standardConfig = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE_HZ),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+      I2S_DATA_BIT_WIDTH_32BIT,
+      I2S_SLOT_MODE_MONO
+    ),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)PIN_I2S_BCLK,
+      .ws = (gpio_num_t)PIN_I2S_WS,
+      .dout = I2S_GPIO_UNUSED,
+      .din = (gpio_num_t)PIN_I2S_DOUT,
+      .invert_flags = {
+        .mclk_inv = false,
+        .bclk_inv = false,
+        .ws_inv = false
+      }
+    }
+  };
+
+  // O pino L/R do INMP441 está ligado ao GND, portanto usamos o canal esquerdo.
+  standardConfig.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+
+  err = i2s_channel_init_std_mode(i2sRxChannel, &standardConfig);
+  if (err != ESP_OK) {
+    Serial.print("Erro ao configurar modo padrão I2S: ");
+    Serial.println(err);
+    i2s_del_channel(i2sRxChannel);
+    i2sRxChannel = nullptr;
+    return false;
+  }
+
+  err = i2s_channel_enable(i2sRxChannel);
+  if (err != ESP_OK) {
+    Serial.print("Erro ao habilitar canal RX I2S: ");
+    Serial.println(err);
+    i2s_del_channel(i2sRxChannel);
+    i2sRxChannel = nullptr;
+    return false;
+  }
+
+  i2sStarted = true;
+
+  Serial.println("I2S configurado com o driver atual.");
+  return true;
+}
+
+void shutdownI2S() {
+  if (i2sRxChannel != nullptr) {
+    if (i2sStarted) {
+      i2s_channel_disable(i2sRxChannel);
+    }
+
+    i2s_del_channel(i2sRxChannel);
+    i2sRxChannel = nullptr;
+    i2sStarted = false;
+  }
+}
+
+void readAudioFeatures() {
+  Serial.println("Lendo áudio do INMP441...");
+
+  const int bufferSamples = 512;
+
+  int32_t buffer[bufferSamples];
+  size_t bytesRead = 0;
+
+  unsigned long start = millis();
+
+  double sumSamples = 0.0;
+  double sumSquares = 0.0;
+  int totalSamples = 0;
+  int zeroCrossings = 0;
+  int previousSign = 0;
+
+  while (millis() - start < AUDIO_WINDOW_MS) {
+    esp_err_t result = i2s_channel_read(
+      i2sRxChannel,
+      (void*)buffer,
+      sizeof(buffer),
+      &bytesRead,
+      1000
+    );
+
+    if (result != ESP_OK || bytesRead == 0) {
+      continue;
+    }
+
+    int samplesRead = bytesRead / sizeof(int32_t);
+
+    for (int i = 0; i < samplesRead; i++) {
+      int32_t sample24 = buffer[i] >> 8;
+
+      double x = sample24 / 8388608.0;
+
+      sumSamples += x;
+      sumSquares += x * x;
+      totalSamples++;
+
+      int sign = 0;
+
+      if (x > 0.0005) sign = 1;
+      else if (x < -0.0005) sign = -1;
+
+      if (sign != 0) {
+        if (previousSign != 0 && sign != previousSign) {
+          zeroCrossings++;
+        }
+
+        previousSign = sign;
+      }
+    }
+  }
+
+  if (totalSamples <= 0) {
+    audioRms = NAN;
+    audioDbfs = NAN;
+    audioZeroCrossHz = NAN;
+    audioSamplesUsed = 0;
+    Serial.println("Falha na leitura de áudio.");
+    return;
+  }
+
+  // Remove o deslocamento DC antes de calcular o RMS. Sem essa correção,
+  // um pequeno offset do microfone seria interpretado como energia acústica.
+  double mean = sumSamples / totalSamples;
+  double variance = (sumSquares / totalSamples) - (mean * mean);
+
+  // Protege contra um pequeno valor negativo causado por arredondamento.
+  if (variance < 0.0) {
+    variance = 0.0;
+  }
+
+  audioRms = sqrt(variance);
+
+  if (audioRms > 0.0000001) {
+    audioDbfs = 20.0 * log10(audioRms);
+  } else {
+    audioDbfs = -120.0;
+  }
+
+  float durationSec = totalSamples / (float)AUDIO_SAMPLE_RATE_HZ;
+
+  // Indicador comparativo do sinal. Em sons complexos, cruzamentos de zero
+  // não correspondem à frequência dominante (isso exigiria análise espectral).
+  audioZeroCrossHz = (zeroCrossings / durationSec) / 2.0;
+  audioSamplesUsed = totalSamples;
+
+  Serial.print("Áudio RMS: ");
+  Serial.print(audioRms, 6);
+  Serial.print(" | dBFS: ");
+  Serial.print(audioDbfs, 1);
+  Serial.print(" | zeroCrossHz: ");
+  Serial.println(audioZeroCrossHz, 1);
+}
+
+
+// =======================================================
+// 17. JSON, ENVIO EM LOTE E EVENTO DA TAMPA
+// =======================================================
+
+String int64ToString(int64_t value) {
+  char buffer[24];
+  snprintf(buffer, sizeof(buffer), "%lld", (long long)value);
+  return String(buffer);
+}
+
+String storedReadingKey(const StoredReading& reading) {
+  char buffer[24];
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "m_%08lx%08lx",
+    (unsigned long)reading.idHigh,
+    (unsigned long)reading.idLow
+  );
+  return String(buffer);
+}
+
+String storedReadingTimeLocal(const StoredReading& reading) {
+  if (!reading.measurementTimeValid || reading.measurementUnixS <= 0) {
+    return "";
+  }
+
+  time_t localTimestamp =
+    (time_t)reading.measurementUnixS + GMT_OFFSET_SECONDS;
+  struct tm localTime;
+  gmtime_r(&localTimestamp, &localTime);
+
+  char buffer[24];
+  strftime(buffer, sizeof(buffer), "%d/%m/%Y %H:%M:%S", &localTime);
+  return String(buffer);
+}
+
+String buildStoredReadingJson(const StoredReading& reading) {
+  String json;
+  json.reserve(1000);
+  json = "{";
+
+  json += "\"id_medicao_local\":\"";
+  json += storedReadingKey(reading);
+  json += "\",";
+  json += "\"tempo_ativo_ms\":" + String(reading.awakeUptimeMs) + ",";
+  json += "\"timestamp_servidor\":{\".sv\":\"timestamp\"},";
+
+  String localTime = storedReadingTimeLocal(reading);
+
+  if (reading.measurementTimeValid &&
+      reading.measurementUnixS > 0 &&
+      localTime.length() > 0) {
+    json += "\"horario_medicao_unix_s\":";
+    json += int64ToString(reading.measurementUnixS);
+    json += ",";
+    json += "\"horario_medicao_local\":\"";
+    json += jsonEscape(localTime);
+    json += "\",";
+  } else {
+    json += "\"horario_medicao_unix_s\":null,";
+    json += "\"horario_medicao_local\":null,";
+  }
+
+  json += "\"fuso_horario_medicao\":\"UTC-03:00\",";
+  json += "\"contagem_inicializacoes\":" + String(reading.bootNumber) + ",";
+  json += "\"causa_despertar\":\"";
+  json += storedWakeupCauseText(reading.wakeupCause);
+  json += "\",";
+
+  json += "\"id_colmeia\":\"" + jsonEscape(HIVE_ID) + "\",";
+  json += "\"tensao_bateria_v\":" + numberOrNull(reading.batteryV, 3) + ",";
+  json += "\"carga_bateria_pct_estimada\":" + numberOrNull(reading.batteryPct, 1) + ",";
+
+  json += "\"temperatura_externa_c\":" + numberOrNull(reading.externalTempC, 1) + ",";
+  json += "\"umidade_externa_pct\":" + numberOrNull(reading.externalHumPct, 1) + ",";
+  json += "\"temperatura_interna_c\":" + numberOrNull(reading.internalTempC, 1) + ",";
+  json += "\"umidade_interna_pct\":" + numberOrNull(reading.internalHumPct, 1) + ",";
+
+  json += "\"leitura_bruta_mc38\":" + String((int)reading.mc38Raw) + ",";
+  json += "\"tampa_aberta\":";
+  json += reading.lidOpen ? "true" : "false";
+  json += ",";
+
+  json += "\"audio_rms\":" + numberOrNull(reading.audioRms, 6) + ",";
+  json += "\"audio_dbfs\":" + numberOrNull(reading.audioDbfs, 1) + ",";
+  json += "\"audio_cruzamentos_zero_hz\":" + numberOrNull(reading.audioZeroCrossHz, 1) + ",";
+  json += "\"amostras_audio_utilizadas\":" + String(reading.audioSamplesUsed) + ",";
+
+  if (WiFi.status() == WL_CONNECTED) {
+    json += "\"sinal_wifi_no_envio_rssi_dbm\":" + String(WiFi.RSSI()) + ",";
+  } else {
+    json += "\"sinal_wifi_no_envio_rssi_dbm\":null,";
+  }
+
+  json += "\"intervalo_coleta_s\":" + String(reading.sleepIntervalSeconds) + ",";
+  json += "\"intervalo_envio_s\":" + String((uint32_t)UPLOAD_INTERVAL_SECONDS) + ",";
+  json += "\"hora_inicio_envios_local\":" + String(UPLOAD_WINDOW_START_HOUR) + ",";
+  json += "\"hora_ultimo_envio_local\":" + String(UPLOAD_WINDOW_LAST_HOUR) + ",";
+  json += "\"intervalo_sono_tampa_aberta_s\":" + String(reading.lidOpenSleepSeconds) + ",";
+  json += "\"janela_audio_ms\":" + String(reading.audioWindowMs) + ",";
+  json += "\"taxa_amostragem_audio_hz\":" + String(reading.audioSampleRateHz) + ",";
+  json += "\"armazenamento_local\":\"LittleFS\",";
+
+  String storedFirmwareVersion = String(reading.firmwareVersion);
+  String storedFirmwareId = "esp32_colmeia_deepsleep_firebase_v";
+  storedFirmwareId += storedFirmwareVersion;
+  storedFirmwareId.replace(".", "_");
+
+  json += "\"firmware\":\"" + jsonEscape(storedFirmwareId) + "\",";
+  json += "\"versao_firmware\":\"";
+  json += jsonEscape(storedFirmwareVersion);
+  json += "\"";
+  json += "}";
+
+  return json;
+}
+
+bool buildNextQueuedBatch(
+  String& payload,
+  size_t& validReadings,
+  size_t& rawRecordsConsumed,
+  StoredReading& lastValidReading
+) {
+  validReadings = 0;
+  rawRecordsConsumed = 0;
+  payload = "{";
+  payload.reserve(READINGS_PER_FIREBASE_BATCH * 1000 + 2);
+
+  if (!localStorageReady || !LittleFS.exists(QUEUE_FILE)) {
+    payload += "}";
+    return false;
+  }
+
+  File file = LittleFS.open(QUEUE_FILE, FILE_READ);
+  if (!file) {
+    payload += "}";
+    return false;
+  }
+
+  while (file.available() >= (int)sizeof(StoredReading) &&
+         validReadings < READINGS_PER_FIREBASE_BATCH) {
+    StoredReading reading;
+    size_t bytesRead = file.read(
+      reinterpret_cast<uint8_t*>(&reading),
+      sizeof(StoredReading)
+    );
+
+    if (bytesRead != sizeof(StoredReading)) break;
+    rawRecordsConsumed++;
+
+    if (!storedReadingIsValid(reading)) {
+      Serial.println("Registro local inválido ignorado.");
+      continue;
+    }
+
+    if (validReadings > 0) payload += ",";
+
+    payload += "\"";
+    payload += storedReadingKey(reading);
+    payload += "\":";
+    payload += buildStoredReadingJson(reading);
+
+    lastValidReading = reading;
+    validReadings++;
+  }
+
+  file.close();
+  payload += "}";
+  return rawRecordsConsumed > 0;
+}
+
+bool uploadSingleReadingDirectly(const StoredReading& reading) {
+  String key = storedReadingKey(reading);
+  String readingJson = buildStoredReadingJson(reading);
+  String batchPayload = "{\"" + key + "\":" + readingJson + "}";
+
+  String basePath = "/hives/" + String(HIVE_ID);
+  bool readingsOk = firebasePatch(basePath + "/readings", batchPayload);
+
+  if (readingsOk) {
+    firebasePut(basePath + "/latest", readingJson);
+  }
+
+  return readingsOk;
+}
+
+bool uploadQueuedReadings() {
+  if (!localStorageReady) {
+    Serial.println("Fila local indisponível.");
+    return false;
+  }
+
+  size_t initialCount = storedReadingCount();
+  Serial.print("Enviando fila periódica. Medições pendentes: ");
+  Serial.println(initialCount);
+
+  if (initialCount == 0) {
+    return true;
+  }
+
+  String basePath = "/hives/" + String(HIVE_ID);
+  String readingsPath = basePath + "/readings";
+  String latestPath = basePath + "/latest";
+
+  while (storedReadingCount() > 0) {
+    String batchPayload;
+    size_t validReadings = 0;
+    size_t rawRecordsConsumed = 0;
+    StoredReading lastValidReading = {};
+
+    bool hasRawRecords = buildNextQueuedBatch(
+      batchPayload,
+      validReadings,
+      rawRecordsConsumed,
+      lastValidReading
+    );
+
+    if (!hasRawRecords) {
+      // Resta apenas uma cauda incompleta no arquivo.
+      Serial.println("Removendo cauda incompleta da fila local.");
+      LittleFS.remove(QUEUE_FILE);
+      break;
+    }
+
+    if (validReadings == 0) {
+      if (!removeFirstRawRecords(rawRecordsConsumed)) return false;
+      continue;
+    }
+
+    Serial.print("Enviando lote com ");
+    Serial.print(validReadings);
+    Serial.println(" medição(ões)...");
+
+    if (!firebasePatch(readingsPath, batchPayload)) {
+      Serial.println("Lote mantido na flash para a próxima tentativa diurna.");
+      return false;
+    }
+
+    // A leitura principal já está segura no Firebase. Uma falha ao atualizar
+    // /latest não impede a remoção do lote, pois não deve criar duplicatas.
+    String latestJson = buildStoredReadingJson(lastValidReading);
+    if (!firebasePut(latestPath, latestJson)) {
+      Serial.println("Aviso: histórico enviado, mas /latest não foi atualizado.");
+    }
+
+    if (!removeFirstRawRecords(rawRecordsConsumed)) {
+      Serial.println("O lote foi enviado, mas permaneceu na fila local.");
+      Serial.println("Na próxima tentativa ele será reenviado com as mesmas chaves, sem duplicação.");
+      return false;
+    }
+  }
+
+  Serial.println("Todas as medições pendentes foram enviadas.");
+  return true;
+}
+
+bool uploadLidEvent(const StoredReading& reading) {
+  if (reading.wakeupCause != WAKEUP_LID) return true;
+
+  String eventJson = "{";
+  eventJson += "\"timestamp_servidor\":{\".sv\":\"timestamp\"},";
+  eventJson += "\"id_medicao_local\":\"" + storedReadingKey(reading) + "\",";
+  eventJson += "\"contagem_inicializacoes\":" + String(reading.bootNumber) + ",";
+  eventJson += "\"id_colmeia\":\"" + jsonEscape(HIVE_ID) + "\",";
+  eventJson += "\"evento\":\"despertar_por_tampa\",";
+  eventJson += "\"tampa_aberta\":";
+  eventJson += reading.lidOpen ? "true" : "false";
+  eventJson += ",";
+  eventJson += "\"leitura_bruta_mc38\":" + String((int)reading.mc38Raw);
+  eventJson += "}";
+
+  String path = "/hives/" + String(HIVE_ID) + "/events/lid";
+  bool ok = firebasePost(path, eventJson);
+
+  if (ok) {
+    Serial.println("Evento de abertura da tampa enviado imediatamente.");
+  } else {
+    Serial.println("Falha no evento imediato; a medição permanece na fila local.");
+  }
+
+  return ok;
+}
+
+
+// =======================================================
+// 18. DEEP SLEEP
+// =======================================================
+
+void goToSleep() {
+  Serial.println("Preparando deep sleep...");
+
+  shutdownI2S();
+  shutdownWiFi();
+
+  // Acordar por tempo.
+  // Se a tampa estiver aberta, reduzimos temporariamente o sono para acompanhar
+  // o evento sem criar um ciclo de acordar imediatamente pelo EXT0.
+  uint64_t sleepSeconds = lidOpen ? LID_OPEN_SLEEP_SECONDS : SLEEP_INTERVAL_SECONDS;
+  lastPlannedSleepSeconds = (uint32_t)sleepSeconds;
+  esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
+
+  // Acordar por abertura da tampa.
+  if (ENABLE_LID_WAKEUP) {
+    // Reconfigura GPIO27 como RTC GPIO.
+    rtc_gpio_init((gpio_num_t)PIN_MC38);
+    rtc_gpio_set_direction((gpio_num_t)PIN_MC38, RTC_GPIO_MODE_INPUT_ONLY);
+
+    // Como o MC-38 está ligado ao GND, usamos pull-up interno.
+    // Isso mantém o pino em HIGH quando o contato está aberto.
+    rtc_gpio_pullup_en((gpio_num_t)PIN_MC38);
+    rtc_gpio_pulldown_dis((gpio_num_t)PIN_MC38);
+
+    // Necessário quando se depende dos resistores internos RTC durante deep sleep.
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+
+    // Evita ciclo infinito:
+    // se a tampa já estiver aberta no momento de dormir, o ESP32 acordaria
+    // imediatamente de novo. Nesse caso, neste ciclo ele dorme apenas por tempo.
+    if (!lidOpen) {
+      esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_MC38, LID_OPEN_LEVEL);
+      Serial.println("Wake-up por tampa habilitado.");
+    } else {
+      Serial.println("Tampa já aberta. Wake-up por tampa desabilitado neste ciclo para evitar loop.");
+    }
+  }
+
+  Serial.print("Dormindo por até ");
+  Serial.print((unsigned long)sleepSeconds);
+  Serial.println(" s, ou até abertura da tampa.");
+
+  Serial.flush();
+  delay(200);
+
+  esp_deep_sleep_start();
+}
+
+
+// =======================================================
+// 19. SETUP
+// =======================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  initializeRtcState();
+  accountForLastSleep();
+  bootCount++;
+
+  Serial.println();
+  Serial.println("=======================================");
+  Serial.println("Sistema de monitoramento da colmeia");
+  Serial.println("Modo: coleta a cada 10 min + envio diurno a cada 2 h");
+  Serial.print("Versao do firmware: ");
+  Serial.println(FIRMWARE_VERSION);
+  Serial.println("=======================================");
+
+  Serial.print("Boot count: ");
+  Serial.println(bootCount);
+
+  Serial.print("Causa do despertar: ");
+  Serial.println(wakeupCauseText());
+
+  localStorageReady = initializeLocalStorage();
+  if (localStorageReady) {
+    Serial.print("Medições pendentes no início do ciclo: ");
+    Serial.println(storedReadingCount());
+  }
+
+  // Para protótipo: simplifica HTTPS sem validar certificado raiz.
+  // Para versão final, o ideal é configurar o certificado raiz.
+  secureClient.setInsecure();
+
+  // O GPIO27 é colocado no domínio RTC antes do deep sleep. Depois de
+  // qualquer reinicialização, devolvemos explicitamente o pino ao GPIO digital.
+  rtc_gpio_deinit((gpio_num_t)PIN_MC38);
+  pinMode(PIN_MC38, INPUT_PULLUP);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_BATTERY, ADC_11db);
+
+  dht1.begin();
+  dht2.begin();
+
+  delay(1500);
+
+  readLidSensor();
+  readBattery();
+  readDHTSensors();
+
+  if (setupI2S()) {
+    readAudioFeatures();
+  } else {
+    Serial.println("Áudio não foi medido neste ciclo.");
+  }
+
+  // Marca o fim do conjunto de medições. O horário absoluto será calculado
+  // pelo relógio RTC ou, nos ciclos de envio, após a sincronização NTP.
+  measurementUptimeMs = millis();
+  captureMeasurementTimeFromClock();
+
+  bool periodicCheckDue = periodicUploadIsDue();
+  bool lidWakeup =
+    esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
+
+  bool clockKnown = systemClockIsValid();
+  bool uploadWindowOpen =
+    clockKnown && uploadWindowIsOpen(time(nullptr));
+
+  // Um despertar pela tampa só é transmitido imediatamente durante o dia.
+  // Fora da janela, a própria medição registra a causa e fica na fila local.
+  bool lidEventAllowed = lidWakeup && uploadWindowOpen;
+  bool lidNeedsTimeCheck = lidWakeup && !clockKnown;
+
+  bool periodicUploadDue = periodicCheckDue && uploadWindowOpen;
+  bool wifiNeeded =
+    periodicCheckDue || lidEventAllowed || lidNeedsTimeCheck;
+  bool wifiConnected = false;
+
+  if (periodicCheckDue && !clockKnown) {
+    Serial.println("Horário ainda desconhecido: Wi-Fi será ligado para consultar o NTP.");
+  } else if (periodicUploadDue) {
+    Serial.println("Chegou o momento da tentativa de envio a cada 2 horas.");
+  } else if (lidEventAllowed) {
+    Serial.println("Wi-Fi será ligado para o evento diurno da tampa.");
+  } else if (lidWakeup) {
+    Serial.println("Evento noturno da tampa: será armazenado, sem envio imediato.");
+  } else if (clockKnown && !uploadWindowOpen) {
+    Serial.println("Fora da janela diurna: Wi-Fi permanecerá desligado.");
+  } else {
+    Serial.println("Coleta intermediária: Wi-Fi permanecerá desligado.");
+  }
+
+  if (wifiNeeded) {
+    wifiConnected = connectWiFi();
+
+    if (wifiConnected) {
+      synchronizeMeasurementTime();
+
+      if (systemClockIsValid()) {
+        time_t nowUtc = time(nullptr);
+        uploadWindowOpen = uploadWindowIsOpen(nowUtc);
+
+        // Reavalia depois do NTP. Isso impede qualquer acesso ao Firebase
+        // durante a madrugada, inclusive após ligar ou reiniciar o ESP32.
+        periodicUploadDue =
+          uploadWindowOpen &&
+          (nextPeriodicUploadUnixS <= 0 ||
+           (int64_t)nowUtc >= nextPeriodicUploadUnixS);
+
+        lidEventAllowed = lidWakeup && uploadWindowOpen;
+
+        if (!uploadWindowOpen) {
+          Serial.println("Janela de envio fechada. Dados preservados até as 06h.");
+
+          // Se a agenda ainda não existia ou ficou no passado, programa 06h
+          // sem fazer uma requisição ao Firebase.
+          if (nextPeriodicUploadUnixS <= 0 ||
+              (int64_t)nowUtc >= nextPeriodicUploadUnixS) {
+            markPeriodicUploadAttempt();
+          }
+        }
+      } else {
+        periodicUploadDue = false;
+        lidEventAllowed = false;
+        Serial.println("Horário não confirmado: Firebase não será acessado neste ciclo.");
+      }
+    }
+  }
+
+  StoredReading currentReading = captureCurrentReading();
+  bool currentStored = appendStoredReading(currentReading);
+
+  if (!currentStored) {
+    Serial.println("Aviso: a medição atual não pôde ser preservada na flash.");
+  }
+
+  if (wifiConnected) {
+    if (lidEventAllowed) {
+      uploadLidEvent(currentReading);
+    }
+
+    if (periodicUploadDue) {
+      if (currentStored) {
+        uploadQueuedReadings();
+      } else {
+        Serial.println("Tentando enviar diretamente a medição não armazenada.");
+        uploadSingleReadingDirectly(currentReading);
+      }
+    }
+  } else if (wifiNeeded) {
+    if (currentStored) {
+      Serial.println("Sem Wi-Fi. Os dados permanecem na flash para uma tentativa futura.");
+    } else {
+      Serial.println("Sem Wi-Fi e sem fila local: a medição atual não poderá ser recuperada.");
+    }
+  }
+
+  // Uma falha não provoca novas tentativas a cada 10 minutos, o que anularia
+  // a economia de energia. A fila será tentada no próximo horário diurno.
+  if (periodicUploadDue) {
+    markPeriodicUploadAttempt();
+  } else if (periodicCheckDue && !systemClockIsValid()) {
+    // Sem NTP, ainda não é possível saber se é madrugada. Espera duas horas
+    // antes de tentar consultar o horário novamente.
+    markPeriodicUploadAttempt();
+  }
+
+  goToSleep();
+}
+
+
+// =======================================================
+// 20. LOOP
+// =======================================================
+//
+// No modelo com deep sleep, o loop fica vazio.
+// O ESP32 reinicia o setup() a cada despertar.
+
+void loop() {
+}
